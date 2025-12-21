@@ -210,26 +210,14 @@ class TFT(object) :
 
       charA = aFont["Data"][ci:ci + fontw]
       px = aPos[0]
-      if aSizes[0] <= 1 and aSizes[1] <= 1 :
-        buf = bytearray(2 * fonth * fontw)
-        for q in range(fontw) :
-          c = charA[q]
-          for r in range(fonth) :
-            if c & 0x01 :
-              pos = 2 * (r * fontw + q)
-              buf[pos] = aColor >> 8
-              buf[pos + 1] = aColor & 0xff
-            c >>= 1
-        self.image(aPos[0], aPos[1], aPos[0] + fontw - 1, aPos[1] + fonth - 1, buf)
-      else:
-        for c in charA :
-          py = aPos[1]
-          for r in range(fonth) :
-            if c & 0x01 :
-              self.fillrect((px, py), aSizes, aColor)
-            py += aSizes[1]
-            c >>= 1
-          px += aSizes[0]
+      for c in charA :
+        py = aPos[1]
+        for r in range(fonth) :
+          if c & 0x01 :
+            self.fillrect((px, py), aSizes, aColor)
+          py += aSizes[1]
+          c >>= 1
+        px += aSizes[0]
 
 #   @micropython.native
   def line( self, aStart, aEnd, aColor ) :
