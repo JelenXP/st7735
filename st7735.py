@@ -1540,8 +1540,205 @@ class TFTBuffered(TFT):
     return x
 
 
-def create(buffered=True, baudrate=32_000_000, size=(128, 160),
-           spi_id=1, sck=26, mosi=27, dc=22, rst=28, cs=20, bl=21):
+class TFTPaletted(TFTBuffered):
+  '''Palette-backed framebuffer for low-RAM boards (e.g. Pico W). Stores 1 byte/pixel
+     (depth=8, up to 256 colors) or 4 bits/pixel (depth=4, 16 colors) instead of RGB565,
+     and converts to RGB565 in small horizontal bands inside show(). Roughly HALF
+     (depth=8) or a QUARTER (depth=4) of the RAM of TFTBuffered, at the cost of a limited
+     palette and a small per-frame conversion pass.
+
+     Draw with palette INDICES (0..255 / 0..15), NOT rgb() values. Define the colors with
+     set_palette(index, r, g, b); the first 16 entries have sensible defaults and the
+     P_* index constants (P_RED, P_GREEN, ...). All the drawing/text helpers are inherited.
+
+     RAM (128x160): depth 8 ~20 KB + ~4 KB band + 512 B palette; depth 4 ~10 KB + ~4 KB.
+
+     Usage:
+        d = st7735.TFTPaletted(spi, DC, RST, CS, (128, 160), depth=8)
+        d.initr(); spi.init(baudrate=32_000_000)
+        d.set_palette(9, 255, 140, 0)          # (re)define index 9 = orange
+        d.fb.fill(d.P_BLACK)
+        d.fb.ellipse(64, 80, 26, 26, d.P_GREEN, True)
+        d.text_size("Ahoj", 8, 8, d.P_WHITE, 12)
+        d.show()'''
+
+  P_BLACK = 0; P_WHITE = 1; P_RED = 2; P_GREEN = 3; P_BLUE = 4
+  P_YELLOW = 5; P_CYAN = 6; P_PURPLE = 7; P_GRAY = 8; P_ORANGE = 9
+
+  _DEFAULT = (                      # (index, r, g, b) for the first 16 palette entries
+    (0, 0, 0, 0),      (1, 255, 255, 255), (2, 255, 0, 0),   (3, 0, 255, 0),
+    (4, 0, 0, 255),    (5, 255, 255, 0),   (6, 0, 255, 255), (7, 255, 0, 255),
+    (8, 128, 128, 128),(9, 255, 140, 0),   (10, 60, 60, 60), (11, 190, 190, 190),
+    (12, 0, 0, 128),   (13, 0, 128, 0),    (14, 128, 0, 0),  (15, 0, 128, 128),
+  )
+
+  def __init__(self, spi, aDC, aReset, aCS, ScreenSize=(128, 160), depth=8, bandh=16):
+    TFT.__init__(self, spi, aDC, aReset, aCS, ScreenSize)   # skip the 40 KB RGB565 alloc
+    if depth not in (4, 8):
+      raise ValueError("depth must be 4 or 8")
+    self.width = ScreenSize[0]
+    self.height = ScreenSize[1]
+    self.depth = depth
+    if bandh > self.height:
+      bandh = self.height
+    self.bandh = bandh
+    if depth == 8:
+      self.buffer = bytearray(self.width * self.height)
+      fmt = framebuf.GS8
+      ncol = 256
+    else:
+      self.buffer = bytearray((self.width * self.height) // 2)
+      fmt = framebuf.GS4_HMSB
+      ncol = 16
+    self.fb = framebuf.FrameBuffer(self.buffer, self.width, self.height, fmt)
+    self._bandbuf = bytearray(self.width * bandh * 2)     # RGB565 conversion strip
+    self._bandfb = framebuf.FrameBuffer(self._bandbuf, self.width, bandh, framebuf.RGB565)
+    self._palbuf = bytearray(ncol * 2)                    # index -> RGB565 lookup for blit
+    self._palette = framebuf.FrameBuffer(self._palbuf, ncol, 1, framebuf.RGB565)
+    self._ncol = ncol
+    self._glyphbuf = bytearray(8)                         # text infra (inherited methods)
+    self._glyphfb = framebuf.FrameBuffer(self._glyphbuf, 8, 8, framebuf.MONO_HLSB)
+    self._dirty = []
+    self._bg = None
+    for i, r, g, b in self._DEFAULT:
+      if i < ncol:
+        self.set_palette(i, r, g, b)
+
+  def set_palette(self, index, r, g, b):
+    '''Define palette entry 'index' as color (r, g, b). Draw with this index afterwards.'''
+    self._palette.pixel(index, 0, TFTBuffered.rgb(r, g, b))
+
+  def show(self):
+    '''Convert the palette framebuffer to RGB565 band by band and push it to the panel.'''
+    W = self.width; H = self.height; bh = self.bandh
+    self._setwindowloc((0, 0), (W - 1, H - 1))
+    self.dc(1)
+    self.cs(0)
+    mv = memoryview(self._bandbuf)
+    pal = self._palette; src = self.fb; band = self._bandfb; spi = self.spi
+    y0 = 0
+    while y0 < H:
+      h = H - y0
+      if h > bh:
+        h = bh
+      band.blit(src, 0, -y0, -1, pal)        # convert source rows [y0, y0+h) -> RGB565
+      spi.write(mv[:W * h * 2])
+      y0 += bh
+    self.cs(1)
+
+  def show_area(self, x, y, w, h):
+    '''Partial refresh of a rectangle, converted through the palette. Full-width areas
+       are cheapest; a narrower area still converts full rows but sends only its columns.'''
+    if y < 0:
+      h += y; y = 0
+    if y + h > self.height:
+      h = self.height - y
+    if x < 0:
+      w += x; x = 0
+    if x + w > self.width:
+      w = self.width - x
+    if w <= 0 or h <= 0:
+      return
+    W = self.width; bh = self.bandh
+    self._setwindowloc((x, y), (x + w - 1, y + h - 1))
+    self.dc(1)
+    self.cs(0)
+    mv = memoryview(self._bandbuf)
+    pal = self._palette; src = self.fb; band = self._bandfb; spi = self.spi
+    rowbytes = w * 2
+    yy = y
+    end = y + h
+    while yy < end:
+      hh = end - yy
+      if hh > bh:
+        hh = bh
+      band.blit(src, 0, -yy, -1, pal)
+      if w == W:
+        spi.write(mv[:W * hh * 2])
+      else:
+        for r in range(hh):
+          start = (r * W + x) * 2
+          spi.write(mv[start:start + rowbytes])
+      yy += bh
+    self.cs(1)
+
+  def restore_background_area(self, x, y, w, h):
+    '''Restore a background rectangle. Works per whole rows (safe for GS8/GS4 packing),
+       so x and w are ignored; only the row range [y, y+h) is restored.'''
+    if self._bg is None:
+      return
+    if y < 0:
+      h += y; y = 0
+    if y + h > self.height:
+      h = self.height - y
+    if h <= 0:
+      return
+    bpr = len(self.buffer) // self.height    # bytes per row (1*W, or W//2 for GS4)
+    start = y * bpr
+    n = h * bpr
+    self.buffer[start:start + n] = self._bg[start:start + n]
+
+
+class TFTBanded(TFTBuffered):
+  '''Band renderer for the lowest RAM. Keeps only a small RGB565 strip (bandh rows) and
+     renders the frame one horizontal band at a time, in FULL RGB565 color. In exchange
+     you supply a draw callback that redraws the whole scene once per band. All drawing
+     and text helpers are inherited (colors are rgb()/C_* as usual).
+
+     RAM (128x160, bandh=20): ~5 KB (vs 40 KB for TFTBuffered).
+
+     Draw in SCREEN coordinates minus the band's y0 (anything off-band is clipped):
+        W, H = d.width, d.height
+        def draw(fb, y0):
+            fb.fill(d.C_BLACK)
+            fb.rect(0, 0 - y0, W, H, d.C_WHITE)
+            fb.ellipse(bx, by - y0, r, r, d.C_RED, True)
+            d.text_size("Ahoj", 8, 8 - y0, d.C_WHITE, 12)
+        d.render(draw)'''
+
+  def __init__(self, spi, aDC, aReset, aCS, ScreenSize=(128, 160), bandh=20):
+    TFT.__init__(self, spi, aDC, aReset, aCS, ScreenSize)
+    self.width = ScreenSize[0]
+    self.height = ScreenSize[1]
+    if bandh > self.height:
+      bandh = self.height
+    self.bandh = bandh
+    self.buffer = bytearray(self.width * bandh * 2)
+    self.fb = framebuf.FrameBuffer(self.buffer, self.width, bandh, framebuf.RGB565)
+    self._glyphbuf = bytearray(8)
+    self._glyphfb = framebuf.FrameBuffer(self._glyphbuf, 8, 8, framebuf.MONO_HLSB)
+    self._dirty = []
+    self._bg = None
+
+  def render(self, draw):
+    '''Render one full frame. 'draw(fb, y0)' is called once per band and must draw the
+       whole scene shifted up by y0 (use screen_y - y0). fb is a bandh-tall framebuffer.'''
+    W = self.width; H = self.height; bh = self.bandh
+    mv = memoryview(self.buffer)
+    spi = self.spi
+    y0 = 0
+    while y0 < H:
+      h = H - y0
+      if h > bh:
+        h = bh
+      draw(self.fb, y0)
+      self._setwindowloc((0, y0), (W - 1, y0 + h - 1))
+      self.dc(1)
+      self.cs(0)
+      spi.write(mv[:W * h * 2])
+      self.cs(1)
+      y0 += bh
+
+  def show(self):
+    raise NotImplementedError("TFTBanded renders via render(draw); there is no full-screen buffer to show()")
+
+  def show_area(self, x, y, w, h):
+    raise NotImplementedError("TFTBanded renders via render(draw); show_area() is not available")
+
+
+def create(buffered=True, mode="full", baudrate=32_000_000, size=(128, 160),
+           spi_id=1, sck=26, mosi=27, dc=22, rst=28, cs=20, bl=21,
+           depth=8, bandh=None):
   '''One-line setup: creates the SPI bus + pins, turns the backlight on, initializes
      the panel (including the SPI clock boost) and returns a display ready to draw on.
 
@@ -1550,11 +1747,25 @@ def create(buffered=True, baudrate=32_000_000, size=(128, 160),
         d = st7735.create(sck=..., mosi=..., dc=..., rst=..., cs=..., bl=...)
         d.fb.fill(0); d.fb.text("Hi", 4, 4, d.C_WHITE); d.show()
 
-     buffered=False returns the plain TFT (for full-screen fills only).'''
+     mode selects the framebuffer memory strategy (see DRIVER_GUIDE.md):
+        "full"   -> TFTBuffered  (full RGB565, ~40 KB, fastest, default)
+        "gs8"    -> TFTPaletted(depth=8)  (~20 KB, 256 palette colors)
+        "gs4"    -> TFTPaletted(depth=4)  (~10 KB, 16 palette colors)
+        "banded" -> TFTBanded    (~5 KB, full color, render(draw) callback)
+     'depth'/'bandh' tune the palette/band modes (bandh defaults: 16 palette, 20 banded).
+     buffered=False returns the plain TFT (for full-screen fills only; ignores mode).'''
   spi = machine.SPI(spi_id, baudrate=baudrate, polarity=0, phase=0,
                     sck=machine.Pin(sck), mosi=machine.Pin(mosi))
-  cls = TFTBuffered if buffered else TFT
-  d = cls(spi, dc, rst, cs, size)
+  if not buffered:
+    d = TFT(spi, dc, rst, cs, size)
+  elif mode == "gs8":
+    d = TFTPaletted(spi, dc, rst, cs, size, depth=8, bandh=bandh or 16)
+  elif mode == "gs4":
+    d = TFTPaletted(spi, dc, rst, cs, size, depth=4, bandh=bandh or 16)
+  elif mode == "banded":
+    d = TFTBanded(spi, dc, rst, cs, size, bandh=bandh or 20)
+  else:                           # "full" (default)
+    d = TFTBuffered(spi, dc, rst, cs, size)
   d.initr()                       #panel init + clk_peri boost
   spi.init(baudrate=baudrate)     #re-init after the boost -> real high clock
   if bl is not None:

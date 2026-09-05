@@ -24,6 +24,9 @@ conveniences.
   3×6 micro fonts for crisp small text, plus `text_centered`, `text_scaled`, `text_width`.
 - **Full Czech diacritics** at every size (á č ď é ě í ň ó ř š ť ú ů ý ž + uppercase),
   drawn procedurally — no extra font tables.
+- **Framebuffer memory modes** — pick per project via `create(mode=…)`: full RGB565 (~40 KB,
+  default), 8-bit palette (~20 KB), 4-bit palette (~10 KB), or banded/strip rendering (~5 KB) for
+  RAM-tight boards like the Pico W. Same drawing API across all of them.
 - **Power helpers** — `backlight(0–100)`, `sleep()`, `wake()`.
 - **One-line setup** — `st7735.create(...)`.
 
@@ -55,6 +58,7 @@ BGR + byte-order quirk. With `TFTBuffered`, nothing appears until you call `d.sh
 | [`examples/hello.py`](examples/hello.py) | Minimal quick start. |
 | [`examples/bounce_fps.py`](examples/bounce_fps.py) | Full-frame animation with a live FPS counter. |
 | [`examples/text_showcase.py`](examples/text_showcase.py) | Text at many sizes + Czech diacritics. |
+| [`examples/low_ram.py`](examples/low_ram.py) | Low-memory framebuffer modes (palette / banded). |
 
 Every example has an editable pin block at the top — set it for your own board.
 

@@ -10,10 +10,12 @@ Verified on RP2350; the RP2040 path uses the documented `0x40008000` CLOCKS base
 
 ## TL;DR
 
-- Two classes in `st7735.py`:
-  - **`TFTBuffered`** — framebuffer-backed. **Use this for all real drawing** (lines, circles, text, moving scenes). ~140 FPS for complex scenes.
+- Classes in `st7735.py`:
+  - **`TFTBuffered`** — full RGB565 framebuffer (~40 KB). **Use this for all real drawing** (lines, circles, text, moving scenes). ~140 FPS for complex scenes. The default and fastest.
+  - **`TFTPaletted`** — palette framebuffer for low-RAM boards: `depth=8` (~20 KB, 256 colors) or `depth=4` (~10 KB, 16 colors). Same drawing API, colors are palette indices. See "Framebuffer memory modes".
+  - **`TFTBanded`** — renders in horizontal strips (~5 KB), full color, via a `render(draw)` callback. Lowest RAM. See "Framebuffer memory modes".
   - **`TFT`** — legacy direct-to-SPI. Only good for pure full-screen fills (~184 FPS). Its `line()`/`circle()` are extremely slow (per-pixel SPI), do **not** use them for animation.
-- `st7735.create()` gives a ready-to-draw display in one line; `initr()` automatically unlocks the SPI clock (see "clk_peri boost").
+- `st7735.create()` gives a ready-to-draw display in one line; `initr()` automatically unlocks the SPI clock (see "clk_peri boost"). Pick a memory mode with `create(mode="full"|"gs8"|"gs4"|"banded")`.
 - Convenience helpers: `d.text_size(...,height)` (text at any pixel height — dedicated 5×7 and 3×6 micro fonts keep small text sharp), `d.text_centered`, `d.mark_dirty` + `d.flush` (auto partial update for many objects), `d.backlight(level)` / `d.sleep()` / `d.wake()` (power).
 - With `TFTBuffered`: draw into `d.fb` (a `framebuf.FrameBuffer`), then call `d.show()` **once** to push the frame. Nothing appears until `show()`.
 - Make colors with `d.rgb(r, g, b)` or the `d.C_*` constants — they already fix this panel's BGR + byte-order quirk. Do **not** feed raw `TFTColor()` values to `d.fb`.
@@ -70,6 +72,74 @@ while True:
     # ... draw everything for this frame into d.fb ...
     d.show()               # blit
 ```
+
+---
+
+## Framebuffer memory modes (RAM vs color vs CPU)
+
+A full RGB565 framebuffer is `width × height × 2` bytes = **~40 KB** at 128×160. That is fine on
+the Pico 2 W (RP2350) but a big chunk of the Pico W's (RP2040) heap — and `set_background()`
+**doubles** it (it keeps a second copy). Pick the mode per project:
+
+| Mode | Class / `create(mode=…)` | RAM @128×160 | Colors | Cost |
+|------|--------------------------|--------------|--------|------|
+| Full RGB565 | `TFTBuffered` / `"full"` (default) | ~40 KB | full 16-bit | none — fastest, simplest |
+| Palette 8-bit | `TFTPaletted(depth=8)` / `"gs8"` | ~20 KB (+~4 KB band) | 256 (palette) | small per-frame convert; ~slightly lower FPS |
+| Palette 4-bit | `TFTPaletted(depth=4)` / `"gs4"` | ~10 KB (+~4 KB band) | 16 (palette) | same convert; fewest colors |
+| Banded | `TFTBanded` / `"banded"` | ~5 KB (bandh=20) | full 16-bit | redraws the scene once per band (RAM→CPU) |
+
+All four share the same drawing primitives and the `text_size` / Czech-diacritics helpers. Only
+**how you feed colors** and **how you push a frame** differ. `set_background()` /
+`restore_background()` also work on the palette modes (on a proportionally smaller copy).
+
+> **Rule of thumb:** default to `TFTBuffered`. On a RAM-constrained Pico W, use `"gs8"` if you
+> want easy full-featured drawing at half the RAM, `"gs4"` if 16 colors are enough (quarter RAM),
+> or `"banded"` if you need the absolute minimum and can structure drawing as a per-band callback.
+
+### Palette modes — `TFTPaletted` (`"gs8"` / `"gs4"`)
+
+Draw with **palette indices** instead of `rgb()` values. The first 16 entries have sensible
+defaults with `P_*` constants; redefine any entry with `set_palette(index, r, g, b)`.
+
+```python
+import st7735
+d = st7735.create(mode="gs8", sck=…, mosi=…, dc=…, rst=…, cs=…, bl=…)   # ~20 KB
+d.set_palette(9, 255, 140, 0)                 # index 9 = orange (already the default)
+
+d.fb.fill(d.P_BLACK)
+d.fb.ellipse(64, 80, 26, 26, d.P_GREEN, True) # colors are indices, not d.C_*
+d.text_size("Ahoj", 8, 8, d.P_WHITE, 12)      # text/Czech work the same
+d.show()                                       # converts palette → RGB565 in bands, then blits
+```
+
+Defaults: `P_BLACK=0 P_WHITE=1 P_RED=2 P_GREEN=3 P_BLUE=4 P_YELLOW=5 P_CYAN=6 P_PURPLE=7
+P_GRAY=8 P_ORANGE=9` (indices 10–15 are grays/darks). `depth=4` (`"gs4"`) is identical but only
+indices 0–15 exist. `bandh` (default 16) sets the conversion strip height — smaller = less RAM,
+slightly more overhead. `show()`, `show_area()`, `mark_dirty`/`flush` all work.
+
+### Banded mode — `TFTBanded` (`"banded"`)
+
+Keeps only a `bandh`-row strip. You provide a `draw(fb, y0)` callback that redraws the **whole
+scene** shifted up by `y0` (draw at `screen_y - y0`); it is called once per band. Off-band pixels
+are clipped, so you can draw everything each time. Colors are normal `rgb()` / `C_*`.
+
+```python
+import st7735
+d = st7735.create(mode="banded", bandh=20, sck=…, mosi=…, dc=…, rst=…, cs=…, bl=…)  # ~5 KB
+W, H = d.width, d.height
+
+def draw(fb, y0):
+    fb.fill(d.C_BLACK)
+    fb.rect(0, 0 - y0, W, H, d.C_WHITE)
+    fb.ellipse(64, 80 - y0, 26, 26, d.C_GREEN, True)
+    d.text_size("Ahoj", 8, 8 - y0, d.C_WHITE, 12)
+
+d.render(draw)     # renders all bands and pushes them; call once per frame
+```
+
+`render()` replaces `show()` here; `show()` / `show_area()` raise `NotImplementedError` on this
+class. CPU scales with (scene cost × number of bands), so keep the per-band drawing lean or use a
+taller `bandh` to trade RAM back for speed.
 
 ---
 
