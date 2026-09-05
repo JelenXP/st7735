@@ -1,64 +1,63 @@
-# SPI TFT with ST7735 Driver library for Raspberry Pi Pico Micropython
+# ST7735 driver for Raspberry Pi Pico — optimized fork
 
-## Acknowledgements
+A performance-optimized MicroPython driver for **ST7735(S) 128×160 SPI TFT** displays,
+running on the **Raspberry Pi Pico W (RP2040)** and **Pico 2 W (RP2350)**.
 
-Based on work from
+This is a fork of [micropython-st7735](https://github.com/alastairhm/micropython-st7735)
+by Alastair Montgomery (itself based on work by Guy Carver and boochow), rewritten into a
+single-file driver with a framebuffer class, much higher frame rates, and extra developer
+conveniences.
 
-* [Guy Carver](https://github.com/GuyCarver)
-* [boochow](https://github.com/boochow)
+## What's different from the original
 
+- **SPI clock boost** — `initr()` repoints `clk_peri` from the 48 MHz USB PLL to the
+  system PLL, lifting the SPI ceiling from ~20 MHz to ~63 MHz. Full-screen fills went from
+  ~52 FPS to ~184 FPS. The chip (RP2040 vs RP2350) is detected at runtime; the boost is a
+  safe no-op on unknown chips.
+- **`TFTBuffered` framebuffer class** — all drawing happens in RAM via the C `framebuf`
+  module, then `show()` pushes the whole frame in one SPI transfer. Complex animated scenes
+  hold ~140+ FPS instead of single digits.
+- **Partial updates** — `show_area()`, a `mark_dirty()` / `flush()` dirty-rectangle manager,
+  and a static-background cache (`set_background()` / `restore_background()`) for even higher
+  effective frame rates.
+- **Text at any pixel size** — `text_size(str, x, y, color, height)` with dedicated 5×7 and
+  3×6 micro fonts for crisp small text, plus `text_centered`, `text_scaled`, `text_width`.
+- **Full Czech diacritics** at every size (á č ď é ě í ň ó ř š ť ú ů ý ž + uppercase),
+  drawn procedurally — no extra font tables.
+- **Power helpers** — `backlight(0–100)`, `sleep()`, `wake()`.
+- **One-line setup** — `st7735.create(...)`.
 
-## Board used for examples
+## Quick start
 
-1.8" inch SPI LCD Screen Module 128*160 TFT with SD Card Slot ST7735 Driver
+Copy `st7735.py` to your board, then:
 
-## Board Description
+```python
+import st7735
 
-* 1.8-inch color screen, support 65K color display, display rich colors
-* 128X160 resolution, clear display
-* Using the SPI serial bus, it only takes a few IOs to light up the display
+# set these to match your wiring
+d = st7735.create(spi_id=1, sck=26, mosi=27, dc=22, rst=28, cs=20, bl=21)
 
+d.fb.fill(0)                                   # black background
+d.fb.ellipse(64, 80, 26, 26, d.C_GREEN, True)  # filled circle
+d.text_size("Hello!", 8, 8, d.C_WHITE, 12)
+d.show()                                        # push the frame in ONE SPI transfer
+```
 
-### Product parameters
+Build colors with `d.rgb(r, g, b)` or the `d.C_*` constants — they handle this panel's
+BGR + byte-order quirk. With `TFTBuffered`, nothing appears until you call `d.show()`.
 
-* Display color: 16BIT RGB 65K color
-* Screen Size: 1.8 (inches)
-* Type: TFT
-* Driver IC: ST7735S
-* Resolution: 128*160 (pixels)
-* Module interface: 4-wire SPI interface
-* Backlight: 2 white LEDs
-* Effective area: 28.03x35.04 (mm)
-* Module PCB Dimensions: 38.30x62.48 (mm)
-* Working temperature: -20℃~60℃
-* Storage temperature: -30℃~70℃
-* Working voltage: 5V/3.3V
-* Weight: 16g
+## Repository contents
 
-## Wiring TFT display to the Raspberry Pi Pico
+| File | Description |
+|------|-------------|
+| [`st7735.py`](st7735.py) | The driver (single file — this is all you need on the board). |
+| [`DRIVER_GUIDE.md`](DRIVER_GUIDE.md) | In-depth reference: API, performance notes, decision rules. |
+| [`examples/hello.py`](examples/hello.py) | Minimal quick start. |
+| [`examples/bounce_fps.py`](examples/bounce_fps.py) | Full-frame animation with a live FPS counter. |
+| [`examples/text_showcase.py`](examples/text_showcase.py) | Text at many sizes + Czech diacritics. |
 
-This is the pin wiring used in the examples code.
+Every example has an editable pin block at the top — set it for your own board.
 
-| TFT Board | Raspberry Pi Pin |
-|:--------:|:-------------:|
-| LED | 3v3(Out)|
-| SCK | GP10 |
-| SDA | GP11 |
-| AO/DC | GP16 |
-| Reset | GP17 |
-| CS | GP18 |
-| GND | GND |
-| VCC | VBUS 5V |
+## License
 
-## Installation 
-
-Upload the directory [st7735](st7735) to your Raspberry Pi Pico.
-
-Upload the BMP files to the root directory to be accessed by [tftbmp.py](tftbmp.py), 
-
-*NOTE* The BMP files will need to be in 24bit format. Thank to [Stu McGee](https://github.com/StuMunsonMcGee) for that information as I had forgotten to include it.
-
-## Example in my blog
-
-* https://blog.0x32.co.uk/posts/pico8/
-
+MIT — see [LICENSE](LICENSE). Original © 2023 Alastair Montgomery; optimizations © 2026 JelenXP.

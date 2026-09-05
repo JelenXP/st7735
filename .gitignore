@@ -1,0 +1,13 @@
+# Python / MicroPython
+__pycache__/
+*.pyc
+*.mpy
+
+# Local development, benchmarks and scratch tests (not part of the published driver)
+main.py
+verify.py
+colortest.py
+debug_font.py
+bench_*.py
+demo_*.py
+test_*.py

@@ -1,10 +1,133 @@
-#driver for Sainsmart 1.8" TFT display ST7735
-#Translated by Guy Carver from the ST7735 sample code.
-#Modirfied for micropython-esp32 by boochow 
+# ST7735(S) MicroPython driver - performance-optimized fork for RP2040 / RP2350
+#
+# Copyright (c) 2023 Alastair Montgomery  (original micropython-st7735)
+# Copyright (c) 2026 JelenXP             (optimizations, framebuffer class, fonts)
+# Released under the MIT License. See the LICENSE file for the full text.
+#
+# Lineage: driver for the Sainsmart 1.8" ST7735 TFT, originally translated by
+# Guy Carver from the ST7735 sample code, adapted for micropython-esp32 by boochow,
+# packaged by Alastair Montgomery, then extended here (see DRIVER_GUIDE.md).
 
 import machine
 import time
+import framebuf
 from math import sqrt
+
+
+def _clocks_base():
+  '''Return the CLOCKS block base address for the current chip (RP2040 vs RP2350),
+     or None on an unknown chip. The register map (CLK_PERI_CTRL at offset 0x48,
+     AUXSRC[7:5], ENABLE bit 11) is identical on both chips; only the base differs.'''
+  import sys
+  m = sys.implementation._machine    # e.g. "...Pico 2 W with RP2350" / "...Pico W with RP2040"
+  if "RP2350" in m:
+    return 0x40010000
+  if "RP2040" in m:
+    return 0x40008000
+  return None
+
+
+def boost_peri_clock():
+  '''RP2040 and RP2350: repoint clk_peri from the 48 MHz USB PLL to the system PLL so
+     SPI is not capped at ~20-24 MHz. Safe for the USB-CDC REPL (that runs off the USB
+     PLL, not clk_peri). No-op if already switched, or on an unknown chip (keeps the
+     default clock source).'''
+  from machine import mem32
+  base = _clocks_base()
+  if base is None:
+    return
+  CLK_PERI_CTRL = base + 0x48
+  ctrl = mem32[CLK_PERI_CTRL]
+  if ((ctrl >> 5) & 0x7) == 1:         # AUXSRC already = clksrc_pll_sys
+    return
+  mem32[CLK_PERI_CTRL] = ctrl & ~(1 << 11)                # disable
+  time.sleep_us(20)
+  ctrl = (mem32[CLK_PERI_CTRL] & ~(0x7 << 5)) | (1 << 5)  # AUXSRC = clksrc_pll_sys
+  mem32[CLK_PERI_CTRL] = ctrl
+  mem32[CLK_PERI_CTRL] = ctrl | (1 << 11)                 # enable
+  time.sleep_us(20)
+
+# Compact 5x7 font (ASCII 0x20-0x7E) for sharp small text below 8 px.
+# 5 bytes per glyph = 5 columns; in each byte bit0 = top row (7 rows).
+_FONT5X7 = bytes((
+  0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x5F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00,
+  0x14,0x7F,0x14,0x7F,0x14, 0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62,
+  0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00, 0x00,0x1C,0x22,0x41,0x00,
+  0x00,0x41,0x22,0x1C,0x00, 0x14,0x08,0x3E,0x08,0x14, 0x08,0x08,0x3E,0x08,0x08,
+  0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00,
+  0x20,0x10,0x08,0x04,0x02, 0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00,
+  0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31, 0x18,0x14,0x12,0x7F,0x10,
+  0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03,
+  0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00,
+  0x00,0x56,0x36,0x00,0x00, 0x08,0x14,0x22,0x41,0x00, 0x14,0x14,0x14,0x14,0x14,
+  0x00,0x41,0x22,0x14,0x08, 0x02,0x01,0x51,0x09,0x06, 0x32,0x49,0x79,0x41,0x3E,
+  0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22,
+  0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x09,0x01,
+  0x3E,0x41,0x49,0x49,0x7A, 0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00,
+  0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41, 0x7F,0x40,0x40,0x40,0x40,
+  0x7F,0x02,0x0C,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E,
+  0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46,
+  0x46,0x49,0x49,0x49,0x31, 0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F,
+  0x1F,0x20,0x40,0x20,0x1F, 0x3F,0x40,0x38,0x40,0x3F, 0x63,0x14,0x08,0x14,0x63,
+  0x07,0x08,0x70,0x08,0x07, 0x61,0x51,0x49,0x45,0x43, 0x00,0x7F,0x41,0x41,0x00,
+  0x02,0x04,0x08,0x10,0x20, 0x00,0x41,0x41,0x7F,0x00, 0x04,0x02,0x01,0x02,0x04,
+  0x40,0x40,0x40,0x40,0x40, 0x00,0x01,0x02,0x04,0x00, 0x20,0x54,0x54,0x54,0x78,
+  0x7F,0x48,0x44,0x44,0x38, 0x38,0x44,0x44,0x44,0x20, 0x38,0x44,0x44,0x48,0x7F,
+  0x38,0x54,0x54,0x54,0x18, 0x08,0x7E,0x09,0x01,0x02, 0x0C,0x52,0x52,0x52,0x3E,
+  0x7F,0x08,0x04,0x04,0x78, 0x00,0x44,0x7D,0x40,0x00, 0x20,0x40,0x44,0x3D,0x00,
+  0x7F,0x10,0x28,0x44,0x00, 0x00,0x41,0x7F,0x40,0x00, 0x7C,0x04,0x18,0x04,0x78,
+  0x7C,0x08,0x04,0x04,0x78, 0x38,0x44,0x44,0x44,0x38, 0x7C,0x14,0x14,0x14,0x08,
+  0x08,0x14,0x14,0x18,0x7C, 0x7C,0x08,0x04,0x04,0x08, 0x48,0x54,0x54,0x54,0x20,
+  0x04,0x3F,0x44,0x40,0x20, 0x3C,0x40,0x40,0x20,0x7C, 0x1C,0x20,0x40,0x20,0x1C,
+  0x3C,0x40,0x30,0x40,0x3C, 0x44,0x28,0x10,0x28,0x44, 0x0C,0x50,0x50,0x50,0x3C,
+  0x44,0x64,0x54,0x4C,0x44, 0x00,0x08,0x36,0x41,0x00, 0x00,0x00,0x7F,0x00,0x00,
+  0x00,0x41,0x36,0x08,0x00, 0x08,0x04,0x08,0x10,0x08,
+))
+
+# Micro 3x6 font (Tom-Thumb style) for sizes <=6 px, where downscaling the 5x7 font
+# falls apart. 3 bytes/glyph = 3 columns, bit0 = top row (6 rows). ASCII 0x20-0x7E.
+# The main body is in rows 0-4, descenders (g j p q y) in row 5 -> 5px = clean top 3x5.
+_FONT3X6 = bytes((
+  0x00,0x00,0x00,0x00,0x17,0x00,0x03,0x00,0x03,0x1F,0x0A,0x1F,0x0A,0x1F,0x05,
+  0x19,0x04,0x13,0x0A,0x15,0x1A,0x00,0x03,0x00,0x00,0x0E,0x11,0x11,0x0E,0x00,
+  0x15,0x0E,0x15,0x04,0x0E,0x04,0x20,0x10,0x00,0x04,0x04,0x04,0x00,0x10,0x00,
+  0x18,0x04,0x03,0x0E,0x11,0x0E,0x12,0x1F,0x10,0x19,0x15,0x12,0x11,0x15,0x0E,
+  0x07,0x04,0x1F,0x17,0x15,0x09,0x0E,0x15,0x08,0x01,0x1D,0x03,0x0A,0x15,0x0A,
+  0x02,0x15,0x0E,0x00,0x0A,0x00,0x20,0x12,0x00,0x04,0x0A,0x11,0x0A,0x0A,0x0A,
+  0x11,0x0A,0x04,0x01,0x15,0x02,0x0E,0x15,0x16,0x1E,0x05,0x1E,0x1F,0x15,0x0A,
+  0x0E,0x11,0x11,0x1F,0x11,0x0E,0x1F,0x15,0x11,0x1F,0x05,0x01,0x0E,0x11,0x1D,
+  0x1F,0x04,0x1F,0x11,0x1F,0x11,0x08,0x10,0x0F,0x1F,0x04,0x1B,0x1F,0x10,0x10,
+  0x1F,0x06,0x1F,0x17,0x0E,0x1D,0x0E,0x11,0x0E,0x1F,0x05,0x02,0x06,0x09,0x16,
+  0x1F,0x05,0x1A,0x12,0x15,0x09,0x01,0x1F,0x01,0x0F,0x10,0x0F,0x07,0x18,0x07,
+  0x1F,0x0C,0x1F,0x1B,0x04,0x1B,0x03,0x1C,0x03,0x19,0x15,0x13,0x1F,0x11,0x11,
+  0x03,0x04,0x18,0x11,0x11,0x1F,0x02,0x01,0x02,0x10,0x10,0x10,0x01,0x02,0x00,
+  0x0C,0x12,0x1E,0x1F,0x14,0x08,0x0C,0x12,0x12,0x08,0x14,0x1F,0x0C,0x16,0x14,
+  0x04,0x1F,0x05,0x24,0x2A,0x1E,0x1F,0x04,0x18,0x00,0x1D,0x00,0x10,0x20,0x1D,
+  0x1F,0x04,0x1A,0x11,0x1F,0x10,0x1E,0x0C,0x1E,0x1E,0x02,0x1C,0x0C,0x12,0x0C,
+  0x3E,0x0A,0x04,0x04,0x0A,0x3E,0x1C,0x02,0x02,0x14,0x16,0x0A,0x02,0x0F,0x12,
+  0x0E,0x10,0x1E,0x06,0x18,0x06,0x1E,0x0C,0x1E,0x12,0x0C,0x12,0x26,0x28,0x1E,
+  0x1A,0x16,0x12,0x04,0x0E,0x11,0x00,0x1F,0x00,0x11,0x0E,0x04,0x04,0x02,0x04,
+))
+
+
+# Czech diacritics: char -> (base ASCII letter, accent type).
+# 1 = acute (carka /), 2 = caron (hacek v), 3 = ring (krouzek o),
+# 4 = apostrophe to the right of the letter (lowercase d - the tall stem is on the right),
+# 5 = apostrophe into the top-right corner of the letter (lowercase t - empty there).
+# The accent is drawn above the base glyph and works at every size.
+_CZ = {
+  "á": ("a", 1), "é": ("e", 1), "í": ("i", 1), "ó": ("o", 1),
+  "ú": ("u", 1), "ý": ("y", 1),
+  "Á": ("A", 1), "É": ("E", 1), "Í": ("I", 1), "Ó": ("O", 1),
+  "Ú": ("U", 1), "Ý": ("Y", 1),
+  "č": ("c", 2), "ě": ("e", 2), "ň": ("n", 2),
+  "ř": ("r", 2), "š": ("s", 2), "ž": ("z", 2),
+  "Č": ("C", 2), "Ě": ("E", 2), "Ň": ("N", 2),
+  "Ř": ("R", 2), "Š": ("S", 2), "Ž": ("Z", 2),
+  "ď": ("d", 4), "ť": ("t", 5), "Ď": ("D", 2), "Ť": ("T", 2),
+  "ů": ("u", 3), "Ů": ("U", 3),
+}
+
 
 #TFTRotations and TFTRGB are bits to set
 # on MADCTL to control display rotation/color layout
@@ -120,6 +243,12 @@ class TFT(object) :
     self.spi = spi
     self.colorData = bytearray(2)
     self.windowLocData = bytearray(4)
+    self.buf = b''
+    self._fillcache = {}     #color -> 8KB pattern buffer (avoids rebuilding each fill)
+    self._fillwin = None     #last full-screen window set (skip CASET/RASET on repeated fills)
+    self._bl_pin = None      #backlight pin number (for backlight()/sleep())
+    self._bl_pwm = None      #lazy PWM object for brightness control
+    self._bl_level = 100     #last brightness set, 0-100
 
   def size( self ) :
     return self._size
@@ -368,12 +497,72 @@ class TFT(object) :
       self.vline((aPos[0] - x, y0), ln, aColor)
 
   def fill( self, aColor = BLACK ) :
-    '''Fill screen with the given color.'''
-    self.fillrect((0, 0), self._size, aColor)
+    '''Fill screen with the given color. Fast path: the window is set only once
+       (repeated fills send RAMWR only), and the pattern buffer comes from the cache.'''
+    w = self._size[0]
+    h = self._size[1]
+    if self._fillwin != self._size:
+      self._setwindowloc((0, 0), (w - 1, h - 1))   #set window + RAMWR
+      self._fillwin = self._size
+    else:
+      self._writecommand(TFT.RAMWR)                #just restart the RAM pointer
+
+    self._setColor(aColor)
+    buf = self.buf
+    spi = self.spi
+    n = w * h
+
+    self.dc(1)
+    self.cs(0)
+    for _ in range(n >> 12):        # n // 4096 full blocks
+      spi.write(buf)
+    rest = n & 0xFFF               # n % 4096
+    if rest:
+      spi.write(bytes(self.colorData) * rest)
+    self.cs(1)
 
   def image( self, x0, y0, x1, y1, data ) :
     self._setwindowloc((x0, y0), (x1, y1))
     self._writedata(data)
+
+  # ---- Power / backlight (convenience helpers) ----
+
+  def attach_backlight( self, aPin ) :
+    '''Register the backlight pin so backlight()/sleep()/wake() work.
+       (create() does this automatically.)'''
+    self._bl_pin = aPin
+
+  def backlight( self, aLevel = 100 ) :
+    '''Set backlight brightness 0-100 %% via PWM. 0 = off, 100 = full brightness.'''
+    if self._bl_pin is None:
+      return
+    aLevel = 0 if aLevel < 0 else (100 if aLevel > 100 else aLevel)
+    self._bl_level = aLevel
+    if aLevel == 100 and self._bl_pwm is None:
+      machine.Pin(self._bl_pin, machine.Pin.OUT).value(1)   #just drive it high
+    if self._bl_pwm is None:
+      self._bl_pwm = machine.PWM(machine.Pin(self._bl_pin))
+      self._bl_pwm.freq(1000)
+    self._bl_pwm.duty_u16(aLevel * 65535 // 100)
+
+  def sleep( self ) :
+    '''Put the panel to sleep (SLPIN) + turn the backlight off. Low power.'''
+    if self._bl_pin is not None:
+      if self._bl_pwm is not None:
+        self._bl_pwm.duty_u16(0)
+      else:
+        machine.Pin(self._bl_pin, machine.Pin.OUT).value(0)
+    self._writecommand(TFT.DISPOFF)
+    self._writecommand(TFT.SLPIN)
+    time.sleep_ms(120)
+
+  def wake( self ) :
+    '''Wake the panel (SLPOUT) + restore the backlight to the last brightness.'''
+    self._writecommand(TFT.SLPOUT)
+    time.sleep_ms(120)
+    self._writecommand(TFT.DISPON)
+    if self._bl_pin is not None:
+      self.backlight(self._bl_level)
 
   def setvscroll(self, tfa, bfa) :
     ''' set vertical scroll area '''
@@ -399,28 +588,46 @@ class TFT(object) :
     self._writedata(data2)
     
 #   @micropython.native
-  def _setColor( self, aColor ) :
+  def _setColor(self, aColor):
     self.colorData[0] = aColor >> 8
-    self.colorData[1] = aColor
-    self.buf = bytes(self.colorData) * 32
+    self.colorData[1] = aColor & 0xFF
 
-#   @micropython.native
-  def _draw( self, aPixels ) :
+    # 4096 pixels x 2 bytes = 8192 bytes.
+    # The buffer is rebuilt only when the color changes (build costs ~2 ms),
+    # otherwise it comes from the cache -> no per-frame overhead.
+    buf = self._fillcache.get(aColor)
+    if buf is None:
+      if len(self._fillcache) > 32:
+        self._fillcache.clear()
+      buf = bytes(self.colorData) * 4096
+      self._fillcache[aColor] = buf
+    self.buf = buf
+
+  def _draw(self, aPixels):
     '''Send given color to the device aPixels times.'''
 
     self.dc(1)
     self.cs(0)
-    for i in range(aPixels//32):
+
+    # Send pixels in large blocks instead of 32 at a time.
+    full_chunks = aPixels // 4096
+
+    for i in range(full_chunks):
       self.spi.write(self.buf)
-    rest = (int(aPixels) % 32)
+
+    rest = aPixels % 4096
+
     if rest > 0:
-        buf2 = bytes(self.colorData) * rest
-        self.spi.write(buf2)
+      self.spi.write(
+        bytes(self.colorData) * rest
+      )
+
     self.cs(1)
 
 #   @micropython.native
   def _setwindowpoint( self, aPos ) :
     '''Set a single point for drawing a color to.'''
+    self._fillwin = None
     x = self._offset[0] + int(aPos[0])
     y = self._offset[1] + int(aPos[1])
     self._writecommand(TFT.CASET)            #Column address set.
@@ -441,6 +648,7 @@ class TFT(object) :
 #   @micropython.native
   def _setwindowloc( self, aPos0, aPos1 ) :
     '''Set a rectangular area for drawing a color to.'''
+    self._fillwin = None
     self._writecommand(TFT.CASET)            #Column address set.
     self.windowLocData[0] = self._offset[0]
     self.windowLocData[1] = self._offset[0] + int(aPos0[0])
@@ -599,6 +807,7 @@ class TFT(object) :
 
   def initr( self ) :
     '''Initialize a red tab version.'''
+    boost_peri_clock()   #unlock the SPI clock from the 48 MHz USB PLL to the system PLL
     self._reset()
 
     self._writecommand(TFT.SWRESET)              #Software reset.
@@ -890,23 +1099,465 @@ class TFT(object) :
 
     self.cs(1)
 
-def maker(  ) :
-  t = TFT(1, "X1", "X2")
-  print("Initializing")
-  t.initr()
-  t.fill(0)
-  return t
+class TFTBuffered(TFT):
+  '''Framebuffer-backed ST7735: every primitive (line, circle, rectangle, text) is
+     drawn in RAM through the built-in `framebuf` module (in C, microseconds), and
+     `show()` sends the whole buffer to the panel in a single SPI transfer (~5 ms).
+     Scene complexity is therefore almost free -> steady high FPS for any drawing.
 
-def makeb(  ) :
-  t = TFT(1, "X1", "X2")
-  print("Initializing")
-  t.initb()
-  t.fill(0)
-  return t
+     Usage:
+        d = st7735.TFTBuffered(spi, DC, RES, CS, (128, 160))
+        d.initr()
+        d.fb.fill(0)
+        d.fb.line(0, 0, 127, 159, d.rgb(255, 0, 0))
+        d.fb.ellipse(64, 80, 30, 30, d.rgb(0, 255, 0), True)
+        d.fb.text("Hi", 10, 10, d.rgb(255, 255, 255))
+        d.show()
 
-def makeg(  ) :
-  t = TFT(1, "X1", "X2")
-  print("Initializing")
-  t.initg()
-  t.fill(0)
-  return t
+     Build colors with `d.rgb(r, g, b)` (or the pre-swapped d.C_* constants), because
+     framebuf RGB565 stores bytes little-endian while the panel reads big-endian.'''
+
+  def __init__(self, spi, aDC, aReset, aCS, ScreenSize=(128, 160)):
+    super().__init__(spi, aDC, aReset, aCS, ScreenSize)
+    self.width = ScreenSize[0]
+    self.height = ScreenSize[1]
+    self.buffer = bytearray(self.width * self.height * 2)
+    self.fb = framebuf.FrameBuffer(
+      self.buffer, self.width, self.height, framebuf.RGB565)
+    self._dirty = []         #list of changed rectangles for flush()
+    self._bg = None          #saved background copy (set_background / restore_background)
+    self._glyphbuf = bytearray(8)   #temporary 8x8 glyph for scaled text
+    self._glyphfb = framebuf.FrameBuffer(self._glyphbuf, 8, 8, framebuf.MONO_HLSB)
+
+  @staticmethod
+  def rgb(aR, aG, aB):
+    '''Color for framebuf. Handles two things at once:
+       - the panel is in BGR mode (MADCTL) -> swap R and B,
+       - framebuf RGB565 stores bytes little-endian, the panel reads big-endian -> swap bytes.'''
+    c = TFTColor(aB, aG, aR)                    # BGR panel: swap R<->B
+    return ((c & 0xFF) << 8) | (c >> 8)         # byte swap for framebuf
+
+  # Pre-computed color constants for use with framebuf.
+  C_BLACK  = 0x0000
+  C_RED    = (((TFTColor(0, 0, 0xFF) & 0xFF) << 8) | (TFTColor(0, 0, 0xFF) >> 8))
+  C_GREEN  = (((TFTColor(0, 0xFF, 0) & 0xFF) << 8) | (TFTColor(0, 0xFF, 0) >> 8))
+  C_BLUE   = (((TFTColor(0xFF, 0, 0) & 0xFF) << 8) | (TFTColor(0xFF, 0, 0) >> 8))
+  C_WHITE  = 0xFFFF
+  C_YELLOW = (((TFTColor(0, 0xFF, 0xFF) & 0xFF) << 8) | (TFTColor(0, 0xFF, 0xFF) >> 8))
+  C_CYAN   = (((TFTColor(0xFF, 0xFF, 0) & 0xFF) << 8) | (TFTColor(0xFF, 0xFF, 0) >> 8))
+  C_PURPLE = (((TFTColor(0xFF, 0, 0xFF) & 0xFF) << 8) | (TFTColor(0xFF, 0, 0xFF) >> 8))
+
+  def show(self):
+    '''Send the whole framebuffer to the panel in a single SPI transfer.'''
+    if self._fillwin != self._size:
+      self._setwindowloc((0, 0), (self.width - 1, self.height - 1))
+      self._fillwin = self._size
+    else:
+      self._writecommand(TFT.RAMWR)
+    self.dc(1)
+    self.cs(0)
+    self.spi.write(self.buffer)
+    self.cs(1)
+
+  def show_area(self, x, y, w, h):
+    '''Partial refresh: send only the rectangle (x, y, w, h) from the framebuffer to
+       the panel. The framebuffer data must already be up to date (draw into self.fb
+       as usual). Transfers only w*h*2 bytes instead of the whole screen -> for small
+       areas many times faster. For a moving object refresh the union of the old and
+       new position (otherwise a "ghost" stays at the old position).'''
+    # clip to the display
+    if x < 0:
+      w += x; x = 0
+    if y < 0:
+      h += y; y = 0
+    if x + w > self.width:
+      w = self.width - x
+    if y + h > self.height:
+      h = self.height - y
+    if w <= 0 or h <= 0:
+      return
+
+    self._setwindowloc((x, y), (x + w - 1, y + h - 1))   # window to the rect (+RAMWR)
+    self.dc(1)
+    self.cs(0)
+    mv = memoryview(self.buffer)
+    stride = self.width * 2          # bytes per row of the full framebuffer
+    if w == self.width:
+      # full width -> contiguous block in memory, single write
+      self.spi.write(mv[y * stride : (y + h) * stride])
+    else:
+      rowbytes = w * 2
+      start = (y * self.width + x) * 2
+      for _ in range(h):
+        self.spi.write(mv[start : start + rowbytes])   # zero-copy row
+        start += stride
+    self.cs(1)
+
+  # ---- Dirty-rectangle manager: send only what changed ----
+
+  def mark_dirty(self, x, y, w, h):
+    '''Mark a rectangle as changed. Call it for BOTH the old and new position of an
+       object, then flush() sends only those areas (for many objects at once too).'''
+    self._dirty.append((int(x), int(y), int(w), int(h)))
+
+  def flush(self):
+    '''Send only the marked (dirty) areas to the panel and clear the list.
+       Overlapping rectangles are merged so pixels are not sent twice.
+       Does nothing if nothing is marked.'''
+    rects = self._dirty
+    if not rects:
+      return
+    merged = []
+    for r in rects:
+      rx, ry, rw, rh = r
+      rx2 = rx + rw; ry2 = ry + rh
+      joined = True
+      while joined:                       #repeat while anything keeps merging
+        joined = False
+        for i in range(len(merged)):
+          mx, my, mx2, my2 = merged[i]
+          if rx < mx2 and rx2 > mx and ry < my2 and ry2 > my:   #overlap
+            rx = mx if mx < rx else rx
+            ry = my if my < ry else ry
+            rx2 = mx2 if mx2 > rx2 else rx2
+            ry2 = my2 if my2 > ry2 else ry2
+            merged.pop(i)
+            joined = True
+            break
+      merged.append((rx, ry, rx2, ry2))
+    self._dirty = []
+    for mx, my, mx2, my2 in merged:
+      self.show_area(mx, my, mx2 - mx, my2 - my)
+
+  # ---- Static-background cache (fast restore instead of re-drawing primitives) ----
+
+  def set_background(self):
+    '''Save the CURRENT framebuffer content as the "background". Draw the static part
+       of the scene (frames, grid, labels) into d.fb and call this once. Then, instead
+       of re-drawing those primitives every frame, restore_background() (a C-fast copy)
+       + drawing the moving things is enough. A big speed-up especially on RP2040.'''
+    if self._bg is None:
+      self._bg = bytearray(self.buffer)   # copy
+    else:
+      self._bg[:] = self.buffer
+
+  def restore_background(self):
+    '''Restore the whole saved background into the framebuffer (one fast C copy).
+       Does nothing if the background has not been saved yet.'''
+    if self._bg is not None:
+      self.buffer[:] = self._bg
+
+  def restore_background_area(self, x, y, w, h):
+    '''Restore only a rectangle of the background (e.g. erase the old position of a
+       moving object). Pairs with show_area(): restore the old area -> draw the object
+       -> show_area. Touches only a small part. Does nothing if no background is saved.'''
+    if self._bg is None:
+      return
+    if x < 0:
+      w += x; x = 0
+    if y < 0:
+      h += y; y = 0
+    if x + w > self.width:
+      w = self.width - x
+    if y + h > self.height:
+      h = self.height - y
+    if w <= 0 or h <= 0:
+      return
+    buf = self.buffer
+    bg = self._bg
+    stride = self.width * 2
+    rowbytes = w * 2
+    start = (y * self.width + x) * 2
+    for _ in range(h):
+      buf[start:start + rowbytes] = bg[start:start + rowbytes]
+      start += stride
+
+  # ---- Text helpers: ANY size (built-in 8x8 font, nearest-neighbor scaled) ----
+
+  def _blit_glyph(self, ch, x, y, color, tw, th, bg, dotless=False):
+    '''Blit a glyph from the 8x8 font scaled to tw x th. Returns (inkL, inkR, inkTop) in px.'''
+    glyph = self._glyphbuf
+    for i in range(8):
+      glyph[i] = 0
+    self._glyphfb.text(ch, 0, 0, 1)
+    if dotless:
+      glyph[0] = 0; glyph[1] = 0     # remove the dot over 'i' (for accented i)
+    fb = self.fb
+    if bg is not None:
+      fb.fill_rect(x, y, tw, th, bg)
+    if tw % 8 == 0 and th % 8 == 0:
+      sx = tw // 8; sy = th // 8
+      fr = fb.fill_rect
+      for gy in range(8):
+        row = glyph[gy]
+        if row:
+          py = y + gy * sy
+          for gx in range(8):
+            if row & (0x80 >> gx):
+              fr(x + gx * sx, py, sx, sy, color)
+    else:
+      px = fb.pixel
+      for oy in range(th):
+        row = glyph[(oy * 8) // th]
+        if row:
+          yy = y + oy
+          for ox in range(tw):
+            if row & (0x80 >> ((ox * 8) // tw)):
+              px(x + ox, yy, color)
+    # glyph outline (for placing the accent): occupied columns + top row
+    orb = 0
+    firstrow = 8
+    for r in range(8):
+      row = glyph[r]
+      if row:
+        orb |= row
+        if firstrow == 8:
+          firstrow = r
+    if orb == 0:
+      return (0, tw, 0)
+    lmin = 0
+    while lmin < 8 and not (orb & (0x80 >> lmin)):
+      lmin += 1
+    rmax = 7
+    while rmax >= 0 and not (orb & (0x80 >> rmax)):
+      rmax -= 1
+    return (lmin * tw // 8, (rmax + 1) * tw // 8, firstrow * th // 8)
+
+  def _blit_glyph_small(self, ch, x, y, color, gw, gh, dotless=False):
+    '''Blit a glyph from the 5x7 font scaled to gw x gh. Returns (inkL, inkR, inkTop) in px.
+       When SHRINKING (gw<5 or gh<7) pixels are OR-merged instead of dropped, so letters
+       stay whole (just bolder) even below the native 7 px. At 7 px and above this is
+       identical to nearest-neighbor (each cell spans 1).'''
+    o = ord(ch)
+    if o < 0x20 or o > 0x7E:
+      o = 0x3F                       # '?' for an unknown char
+    base = (o - 0x20) * 5
+    font = _FONT5X7
+    px = self.fb.pixel
+    for ox in range(gw):
+      col = font[base + (ox * 5) // gw]   # native width (gw=5) -> exact column
+      if dotless:
+        col &= 0xFE                       # remove the top row (the dot over 'i')
+      if col:
+        xx = x + ox
+        for oy in range(gh):
+          r0 = (oy * 7) // gh
+          r1 = ((oy + 1) * 7) // gh
+          if r1 <= r0:
+            r1 = r0 + 1
+          mask = 0
+          for r in range(r0, r1):         # OR vertically -> letters stay whole (bolder)
+            mask |= (1 << r)
+          if col & mask:
+            px(xx, y + oy, color)
+    lmin = 5; rmax = -1; orc = 0
+    for c in range(5):
+      cb = font[base + c]
+      if dotless:
+        cb &= 0xFE
+      if cb:
+        orc |= cb
+        if c < lmin:
+          lmin = c
+        if c > rmax:
+          rmax = c
+    if rmax < 0:
+      return (0, gw, 0)
+    minrow = 0
+    while not (orc & (1 << minrow)):
+      minrow += 1
+    return (lmin * gw // 5, (rmax + 1) * gw // 5, minrow * gh // 7)
+
+  def _blit_glyph_micro(self, ch, x, y, color, gw, gh, dotless=False):
+    '''Blit a glyph from the micro 3x6 font (native width 3). Returns (inkL, inkR, inkTop).
+       gh=6 is native; gh=5 -> drops row 5 (descenders only), the top 3x5 stays fully clean.'''
+    o = ord(ch)
+    if o < 0x20 or o > 0x7E:
+      o = 0x3F
+    base = (o - 0x20) * 3
+    font = _FONT3X6
+    px = self.fb.pixel
+    for ox in range(gw):
+      col = font[base + (ox * 3) // gw]
+      if dotless:
+        col &= 0x3E                  # remove the top row (the dot over 'i')
+      if col:
+        xx = x + ox
+        for oy in range(gh):
+          if col & (1 << ((oy * 6) // gh)):
+            px(xx, y + oy, color)
+    lmin = 3; rmax = -1; orc = 0
+    for c in range(3):
+      cb = font[base + c]
+      if dotless:
+        cb &= 0x3E
+      if cb:
+        orc |= cb
+        if c < lmin:
+          lmin = c
+        if c > rmax:
+          rmax = c
+    if rmax < 0:
+      return (0, gw, 0)
+    minrow = 0
+    while not (orc & (1 << minrow)):
+      minrow += 1
+    return (lmin * gw // 3, (rmax + 1) * gw // 3, minrow * gh // 6)
+
+  def _cell(self, height):
+    '''Return (tier, glyph_width, gap). tier: 0=large 8x8 (>=8px), 1=5x7 (7px),
+       2=micro 3x6 (<=6px). The width is native to the chosen font (not compressed).'''
+    if height >= 8:
+      return 0, height, 0
+    if height == 7:
+      return 1, 5, 1
+    return 2, 3, 1        # micro 3x6, native width 3 + 1 gap
+
+  def _tline(self, x1, y1, x2, y2, color, thick):
+    '''A line 'thick' px wide (offset in x) - for bolder accents on larger fonts.'''
+    fb = self.fb
+    fb.line(x1, y1, x2, y2, color)
+    for i in range(1, thick):
+      fb.line(x1 + i, y1, x2 + i, y2, color)
+
+  def _accent(self, gx, y, inkl, inkr, inktop, height, acc, color):
+    '''Draw a Czech accent just above the letter's REAL top (inktop). The size grows
+       with the font height; on small fonts (<12 px) it stays tiny and un-shifted (so
+       small fonts look as before). 1=acute /, 2=caron v, 3=ring o, 4/5=apostrophe (d/t).'''
+    fb = self.fb
+    w = height // 5               # mark size
+    if w < 2:
+      w = 2
+    thick = 1 if height < 14 else 2
+    top = y + inktop              # the letter's real top
+    if acc == 4 or acc == 5:      # apostrophe (d: right of the stem / t: top-right corner)
+      if acc == 4:                # d: to the right, past the stem
+        tx = gx + inkr + (2 if height >= 12 else 1)
+      else:                       # t: into the top-right corner (empty there)
+        tx = gx + inkr - (4 if height >= 12 else 2)
+      atop = top - w
+      if atop < 0:
+        atop = 0
+      abot = top + w // 2
+      if height < 12:                # small font: shorter apostrophe (was too long)
+        abot -= 1
+      if abot <= atop:
+        abot = atop + 1
+      self._tline(tx, atop, tx, abot, color, thick)
+      return
+    big = height >= 12
+    gap = 1 if big else 0         # +1 up on large fonts
+    b = top - 1 - gap             # bottom of the mark just above the letter
+    if b < 0:
+      b = 0
+    mid = gx + (inkl + inkr) // 2
+    if acc == 1:                  # acute  /  (+2 right on large fonts)
+      cxa = mid + (2 if big else 0)
+      hw = w * 2 // 3
+      if hw < 1:
+        hw = 1
+      self._tline(cxa - hw, b, cxa + hw, b - w, color, thick)
+    elif acc == 2:                # caron  v  (+1 right on large fonts)
+      cxc = mid + (1 if big else 0)
+      self._tline(cxc - w, b - w, cxc, b, color, thick)
+      self._tline(cxc + w, b - w, cxc, b, color, thick)
+    else:                         # ring  o
+      ry = w // 2
+      if ry < 1:
+        ry = 1
+      cyr = b - ry
+      fb.ellipse(mid, cyr, w, ry, color)
+      if thick > 1:
+        fb.ellipse(mid, cyr, w - 1 if w > 1 else 1, ry, color)
+
+  def text_size(self, aStr, x, y, color, height, bg=None, spacing=None):
+    '''Draw text at ANY height 'height' px, including Czech diacritics.
+       7 px uses the sharp 5x7 font, <=6 px the micro 3x6 font, >=8 px scales the
+       built-in 8x8 font. Letters have a uniform full height; accents are drawn ABOVE
+       the line, so leave ~height//7 + 1 px of space above the text.
+       bg = background color, spacing = gap between glyphs.'''
+    if height < 1:
+      height = 1
+    tier, gw, gap = self._cell(height)
+    if spacing is not None:
+      gap = spacing
+    cz = _CZ
+    step = gw + gap
+    cx = x
+    for ch in aStr:
+      acc = 0
+      dotless = False
+      m = cz.get(ch)
+      if m:
+        ch, acc = m
+        if ch == "i":
+          dotless = True                      # dotless i (the accent replaces the dot)
+      if bg is not None and tier != 0:
+        self.fb.fill_rect(cx, y, step, height, bg)
+      if tier == 0:
+        inkl, inkr, inktop = self._blit_glyph(ch, cx, y, color, height, height, bg, dotless)
+      elif tier == 1:
+        inkl, inkr, inktop = self._blit_glyph_small(ch, cx, y, color, gw, height, dotless)
+      else:
+        inkl, inkr, inktop = self._blit_glyph_micro(ch, cx, y, color, gw, height, dotless)
+      if acc:
+        self._accent(cx, y, inkl, inkr, inktop, height, acc, color)
+      cx += step
+      if acc == 4:               # d with apostrophe needs a little room on the right
+        cx += 2 if height >= 12 else 1
+    return cx
+
+  def text_scaled(self, aStr, x, y, color, scale=1, bg=None):
+    '''Text enlarged 'scale' times (may be fractional, e.g. 1.5). scale=1 -> 8 px.'''
+    h = int(round(8 * scale))
+    if h < 1:
+      h = 1
+    return self.text_size(aStr, x, y, color, h, bg)
+
+  def text_width(self, aStr, height=None, scale=1, spacing=None):
+    '''Return the text width in px for a given size (for alignment/layout).'''
+    h = height if height is not None else int(round(8 * scale))
+    if h < 1:
+      h = 1
+    n = len(aStr)
+    if not n:
+      return 0
+    tier, gw, gap = self._cell(h)
+    if spacing is not None:
+      gap = spacing
+    return n * (gw + gap)
+
+  def text_centered(self, aStr, y, color, scale=1, bg=None, height=None):
+    '''Text horizontally centered across the display width. Pass either scale or height (px).
+       Returns the x used.'''
+    h = height if height is not None else int(round(8 * scale))
+    if h < 1:
+      h = 1
+    x = (self.width - self.text_width(aStr, height=h)) // 2
+    if x < 0:
+      x = 0
+    self.text_size(aStr, x, y, color, h, bg)
+    return x
+
+
+def create(buffered=True, baudrate=32_000_000, size=(128, 160),
+           spi_id=1, sck=26, mosi=27, dc=22, rst=28, cs=20, bl=21):
+  '''One-line setup: creates the SPI bus + pins, turns the backlight on, initializes
+     the panel (including the SPI clock boost) and returns a display ready to draw on.
+
+     Pass your own pin numbers to match your wiring. Usage:
+        import st7735
+        d = st7735.create(sck=..., mosi=..., dc=..., rst=..., cs=..., bl=...)
+        d.fb.fill(0); d.fb.text("Hi", 4, 4, d.C_WHITE); d.show()
+
+     buffered=False returns the plain TFT (for full-screen fills only).'''
+  spi = machine.SPI(spi_id, baudrate=baudrate, polarity=0, phase=0,
+                    sck=machine.Pin(sck), mosi=machine.Pin(mosi))
+  cls = TFTBuffered if buffered else TFT
+  d = cls(spi, dc, rst, cs, size)
+  d.initr()                       #panel init + clk_peri boost
+  spi.init(baudrate=baudrate)     #re-init after the boost -> real high clock
+  if bl is not None:
+    d.attach_backlight(bl)
+    d.backlight(100)
+  return d
